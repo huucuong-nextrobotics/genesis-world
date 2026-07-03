@@ -209,7 +209,9 @@ def parse_xml(morph, surface):
         links_to_keep = morph.links_to_keep
 
     # Build model from XML (either URDF or MJCF)
+    print('inside parse xml step 1')
     mj = build_model(morph.file, not morph.visualization, morph.default_armature, merge_fixed_links, links_to_keep)
+    print('inside parse xml step 2')
 
     # We have another more informative warning later so we suppress this one
     # gs.logger.warning(f"(MJCF) Approximating tendon by joint actuator for `{j_info['name']}`")
@@ -218,15 +220,19 @@ def parse_xml(morph, surface):
 
     # Parse all geometries grouped by parent joint (or world)
     links_g_infos = parse_geoms(mj, morph.scale, surface, morph.file)
+    print('inside parse xml step 3')
 
     # Parse all bodies (links and joints)
     l_infos, links_j_infos = parse_links(mj, morph.scale)
+    print('inside parse xml step 4')
 
     # Re-order kinematic tree info
     l_infos, links_j_infos, links_g_infos, _ = uu.order_links_depth_first(l_infos, links_j_infos, links_g_infos)
+    print('inside parse xml step 5')
 
     # Parsing all equality constraints
     eqs_info = parse_equalities(mj, morph.scale)
+    print('inside parse xml step 6')
 
     return l_infos, links_j_infos, links_g_infos, eqs_info
 
@@ -633,7 +639,10 @@ def parse_geoms(mj, scale, surface, xml_path):
 
     # Loop over all geometries sequentially
     is_any_col = False
+    print('inside parse geoms step 1')
+
     for i_g in range(mj.ngeom):
+        print(f'parsing geom {i_g} of {mj.ngeom}')
         if mj.geom_bodyid[i_g] < 0:
             continue
 
@@ -649,9 +658,11 @@ def parse_geoms(mj, scale, surface, xml_path):
         # assign geoms to link
         link_idx = mj.geom_bodyid[i_g]
         links_g_info[link_idx].append(g_info)
+    print('inside parse geoms step 2')
 
     # Update contype and conaffinity to take into account any additional list of explicitly excluded collision pairs
     if mj.nexclude:
+        print('inside parse geoms step 3')
         # Extract the list of collision geometries
         cg_infos = []
         for g_info in chain.from_iterable(links_g_info):
@@ -662,6 +673,7 @@ def parse_geoms(mj, scale, surface, xml_path):
         invalid_set = set()
         for i, g_info_1 in enumerate(cg_infos):
             for j, g_info_2 in enumerate(cg_infos):
+                print(f'checking pair {i}, {j}')
                 if i >= j:
                     continue
                 if g_info_1["contype"] & g_info_2["conaffinity"]:
@@ -686,16 +698,18 @@ def parse_geoms(mj, scale, surface, xml_path):
             for geom_1 in geoms_1:
                 for geom_2 in geoms_2:
                     invalid_set.add(frozenset((geom_1, geom_2)))
-
+        print('inside parse geoms step 4')
         # Compute updated contype and conaffinity from the complete list of invalid collision pairs
         is_success = False
         N = len(cg_infos)
         for K in range(1, 32):
+            print(f'checking K={K}')
             s = z3.Solver()
             contype_bits = [[z3.Bool(f"contype_{i}_{b}") for b in range(K)] for i in range(N)]
             conaffinity_bits = [[z3.Bool(f"conaffinity_{i}_{b}") for b in range(K)] for i in range(N)]
             for i in range(N):
                 for j in range(i + 1, N):
+                    # print('checking pair', i, j, K)
                     cond1 = z3.Or([z3.And(contype_bits[i][b], conaffinity_bits[j][b]) for b in range(K)])
                     cond2 = z3.Or([z3.And(contype_bits[j][b], conaffinity_bits[i][b]) for b in range(K)])
                     pair = frozenset((i, j))
@@ -703,7 +717,15 @@ def parse_geoms(mj, scale, surface, xml_path):
                         s.add(z3.Not(cond1), z3.Not(cond2))
                     else:
                         s.add(z3.Or(cond1, cond2))
-            if s.check() == z3.sat:
+            print('endloop')
+
+            # Set timeout to 5000 ms (5 seconds)
+            s.set(timeout=4000)
+
+            result = s.check()
+
+            if result == z3.sat:
+                print('found solution')
                 is_success = True
                 model = s.model()
                 for g_info, contype_bits_i, conaffinity_bits_i in zip(cg_infos, contype_bits, conaffinity_bits):
@@ -712,7 +734,13 @@ def parse_geoms(mj, scale, surface, xml_path):
                         for bits in (contype_bits_i, conaffinity_bits_i)
                     )
                 break
+            elif result == z3.unknown:
+                # Usually indicates timeout (or another reason)
+                print("Solver timed out, continuing...")
+                continue
 
+            print('end K loop')
+        print('inside parse geoms step 5')
         if not is_success:
             gs.logger.warning(
                 "Compatible collision geometries cannot be described using bitmasks 'contype' and 'conaffinity'. "
