@@ -271,13 +271,10 @@ class ConstraintState:
     Ma_ws: qd.Tensor
     grad: qd.Tensor
     Mgrad: qd.Tensor
-    MinvJT: qd.Tensor
     search: qd.Tensor
     efc_D: qd.Tensor
     efc_frictionloss: qd.Tensor
     efc_force: qd.Tensor
-    efc_b: qd.Tensor
-    efc_AR: qd.Tensor
     active: qd.Tensor
     prev_active: qd.Tensor
     qfrc_constraint: qd.Tensor
@@ -398,14 +395,6 @@ def get_constraint_state(constraint_solver, solver):
     )
 
     jac_shape = (len_constraints_, solver.n_dofs_, _B)
-    # The decomposed (parallel) noslip build computes MinvJT and efc_AR/efc_b for all envs before the force-update
-    # sweep. The serialized path instead fuses build, sweep, and finish per env (kernel_noslip_fused): each env consumes
-    # its AR block right after writing it, so a single batch slot shared by all envs suffices. This keeps the scratch
-    # cache-hot across the fused phases and shrinks its memory footprint by n_envs, and MinvJT is never needed.
-    noslip = solver._options.noslip_iterations > 0
-    noslip_decomposed = noslip and solver._static_rigid_sim_config.para_level >= gs.PARA_LEVEL.PARTIAL
-    efc_AR_shape = maybe_shape((len_constraints_, len_constraints_, _B if noslip_decomposed else 1), noslip)
-    efc_b_shape = maybe_shape((len_constraints_, _B if noslip_decomposed else 1), noslip)
     # The sparse-Jacobian representation is always active, so its index buffers are always allocated. The skyline DOF
     # permutation/envelope buffers stay gated on sparse_solve (CPU-only skyline Cholesky).
     jac_dofs_idx_shape = jac_shape
@@ -415,12 +404,6 @@ def get_constraint_state(constraint_solver, solver):
     if math.prod(jac_shape) > np.iinfo(np.int32).max:
         gs.raise_exception(
             f"Jacobian shape (n_constraints={len_constraints_}, n_dofs={solver.n_dofs_}, n_envs={_B}) is too large."
-        )
-    if math.prod(efc_AR_shape) > np.iinfo(np.int32).max:
-        gs.raise_exception(
-            f"efc_AR shape (n_constraints={len_constraints_}, n_constraints={len_constraints_}, "
-            f"n_envs={efc_AR_shape[2]}) is too large. Consider setting a smaller 'max_contacts' in RigidOptions "
-            "to reduce the size of reserved memory."
         )
 
     # /!\ Changing allocation order of these tensors may reduce runtime speed by >10%  /!\
@@ -450,7 +433,6 @@ def get_constraint_state(constraint_solver, solver):
         Ma_ws=V(dtype=gs.qd_float, shape=(solver.n_dofs_, _B), layout=dof_vec_layout),
         grad=V(dtype=gs.qd_float, shape=(solver.n_dofs_, _B), layout=dof_vec_layout),
         Mgrad=V(dtype=gs.qd_float, shape=(solver.n_dofs_, _B), layout=dof_vec_layout),
-        MinvJT=V(dtype=gs.qd_float, shape=maybe_shape(jac_shape, noslip_decomposed)),
         search=V(dtype=gs.qd_float, shape=(solver.n_dofs_, _B), layout=dof_vec_layout),
         qfrc_constraint=V(dtype=gs.qd_float, shape=(solver.n_dofs_, _B), layout=dof_vec_layout),
         qacc=V(dtype=gs.qd_float, shape=(solver.n_dofs_, _B), layout=dof_vec_layout),
@@ -474,8 +456,6 @@ def get_constraint_state(constraint_solver, solver):
         dof_sort_key=V(dtype=gs.qd_float, shape=sparse_dof_shape),
         incr_changed_idx=V(dtype=gs.qd_int, shape=(len_constraints_, _B), layout=serial_layout),
         incr_n_changed=V(dtype=gs.qd_int, shape=(_B,)),
-        efc_b=V(dtype=gs.qd_float, shape=efc_b_shape),
-        efc_AR=V(dtype=gs.qd_float, shape=efc_AR_shape),
         # Layout-flippable constraint-state tensors: allocated as qd.Tensor wrappers, optionally with
         # ``layout=(1, 0)`` to physically store as (_B, len_constraints_). Canonical shape stays (len_constraints_, _B);
         # kernel-body indexing ``Jaref[i_c, i_b]`` is rewritten by the AST when ``layout != None``.
@@ -908,10 +888,34 @@ def get_collider_state(
 
 
 @dataclasses.dataclass(eq=True, kw_only=False, frozen=True)
+class VertsSpatialGrid:
+    # Per-geom 8x8x8 grid over collision verts in the local AABB: a permutation of vert indices sorted by grid
+    # cell (z fastest), the matching vert positions duplicated in that order for sequential streaming, and per-cell
+    # vert ranges (8^3 + 1 entries per geom), so a scan visits only the cells overlapping a query box. The cell
+    # mapping is anchored by geoms_origin / geoms_inv_cell_size in the geom frame.
+    verts_idx: qd.Tensor
+    verts_pos: qd.Tensor
+    cells_vert_start: qd.Tensor
+    geoms_origin: qd.Tensor
+    geoms_inv_cell_size: qd.Tensor
+
+
+def get_verts_spatial_grid(solver):
+    return VertsSpatialGrid(
+        verts_idx=V(dtype=gs.qd_int, shape=(solver.n_verts_,)),
+        verts_pos=V_VEC(3, dtype=gs.qd_float, shape=(solver.n_verts_,)),
+        cells_vert_start=V(dtype=gs.qd_int, shape=(max(solver.n_geoms * (8**3 + 1), 1),)),
+        geoms_origin=V_VEC(3, dtype=gs.qd_float, shape=(solver.n_geoms_,)),
+        geoms_inv_cell_size=V_VEC(3, dtype=gs.qd_float, shape=(solver.n_geoms_,)),
+    )
+
+
+@dataclasses.dataclass(eq=True, kw_only=False, frozen=True)
 class ColliderInfo:
     vert_neighbors: qd.Tensor
     vert_neighbor_start: qd.Tensor
     vert_n_neighbors: qd.Tensor
+    verts_spatial_grid: VertsSpatialGrid
     # (i_ga, i_gb) -> dense pair index, or -1 if invalid. Used by SAP broadphase, narrowphase, and contact cache.
     collision_pair_idx: qd.Tensor
     max_possible_pairs: qd.Tensor
@@ -956,6 +960,7 @@ def get_collider_info(solver, n_vert_neighbors, n_valid_pairs, collider_static_c
         vert_neighbors=V(dtype=gs.qd_int, shape=(max(n_vert_neighbors, 1),)),
         vert_neighbor_start=V(dtype=gs.qd_int, shape=(solver.n_verts_,)),
         vert_n_neighbors=V(dtype=gs.qd_int, shape=(solver.n_verts_,)),
+        verts_spatial_grid=get_verts_spatial_grid(solver),
         collision_pair_idx=V(dtype=gs.qd_int, shape=(solver.n_geoms_, solver.n_geoms_)),
         max_possible_pairs=V(dtype=gs.qd_int, shape=()),
         max_collision_pairs=V(dtype=gs.qd_int, shape=()),
@@ -1514,6 +1519,9 @@ class SDFGeomInfo:
     sdf_max: qd.Tensor
     sdf_cell_size: qd.Tensor
     sdf_cell_start: qd.Tensor
+    # Coarse min-grid companion: per-block minima over grid nodes, a certified lower bound of the trilinear sd.
+    sdf_coarse_res: qd.Tensor
+    sdf_coarse_cell_start: qd.Tensor
 
 
 def get_sdf_geom_info(n_geoms):
@@ -1523,6 +1531,8 @@ def get_sdf_geom_info(n_geoms):
         sdf_max=V(dtype=gs.qd_float, shape=(n_geoms,)),
         sdf_cell_size=V_VEC(3, dtype=gs.qd_float, shape=(n_geoms,)),
         sdf_cell_start=V(dtype=gs.qd_int, shape=(n_geoms,)),
+        sdf_coarse_res=V_VEC(3, dtype=gs.qd_int, shape=(n_geoms,)),
+        sdf_coarse_cell_start=V(dtype=gs.qd_int, shape=(n_geoms,)),
     )
 
 
@@ -1533,9 +1543,10 @@ class SDFInfo:
     geoms_sdf_val: qd.Tensor
     geoms_sdf_grad: qd.Tensor
     geoms_sdf_closest_vert: qd.Tensor
+    geoms_sdf_coarse_val: qd.Tensor
 
 
-def get_sdf_info(n_geoms, n_cells):
+def get_sdf_info(n_geoms, n_cells, n_coarse_cells):
     if math.prod((n_cells, 3)) > np.iinfo(np.int32).max:
         gs.raise_exception(
             f"SDF Gradient shape (n_cells={n_cells}, 3) is too large. Consider manually setting larger "
@@ -1548,6 +1559,7 @@ def get_sdf_info(n_geoms, n_cells):
         geoms_sdf_val=V(dtype=gs.qd_float, shape=(max(n_cells, 1),)),
         geoms_sdf_grad=V_VEC(3, dtype=gs.qd_float, shape=(max(n_cells, 1),)),
         geoms_sdf_closest_vert=V(dtype=gs.qd_int, shape=(max(n_cells, 1),)),
+        geoms_sdf_coarse_val=V(dtype=gs.qd_float, shape=(max(n_coarse_cells, 1),)),
     )
 
 
@@ -1900,6 +1912,7 @@ class GeomsInfo:
     conaffinity: qd.Tensor
     is_fixed: qd.Tensor
     is_decomposed: qd.Tensor
+    is_hollow: qd.Tensor
     needs_coup: qd.Tensor
     coup_friction: qd.Tensor
     coup_softness: qd.Tensor
@@ -1934,6 +1947,7 @@ def get_geoms_info(solver):
         conaffinity=V(dtype=gs.qd_int, shape=shape),
         is_fixed=V(dtype=gs.qd_bool, shape=shape),
         is_decomposed=V(dtype=gs.qd_bool, shape=shape),
+        is_hollow=V(dtype=gs.qd_bool, shape=shape),
         needs_coup=V(dtype=gs.qd_int, shape=shape),
         coup_friction=V(dtype=gs.qd_float, shape=shape),
         coup_softness=V(dtype=gs.qd_float, shape=shape),

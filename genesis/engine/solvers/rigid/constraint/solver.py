@@ -25,6 +25,36 @@ from . import noslip as constraint_noslip
 
 
 @qd.func
+def _append_relevant_dof(
+    constraint_state: array_class.ConstraintState,
+    i_con: qd.int32,
+    i_d: qd.int32,
+    n: qd.int32,
+    i_b: qd.int32,
+    dedup: qd.int32,
+):
+    """Append dof i_d to jac_dofs_idx[i_con, :n, i_b] unless already present, returning the new count.
+
+    A row coupling two links of the same kinematic tree walks both ancestor chains, so shared ancestor DOFs come up
+    twice: every sparse consumer (J.v / J^T.v products, Hessian assembly, noslip residuals) treats the list as a
+    set, and appending duplicates blindly can push the count past the row capacity (n_dofs), spilling into the next
+    row. The serialized CPU assembly rebuilds rows in index order and self-heals the spill, but the parallel GPU
+    assembly does not, leaving clobbered supports. Duplicates only ever arise while walking the second chain of a
+    row whose links share a kinematic root, so callers pass dedup=False everywhere else and the O(n) scan - which
+    costs >10% on contact-heavy free-body scenes - is skipped.
+    """
+    is_new = True
+    if dedup:
+        for j in range(n):
+            if constraint_state.jac_dofs_idx[i_con, j, i_b] == i_d:
+                is_new = False
+    if is_new:
+        constraint_state.jac_dofs_idx[i_con, n, i_b] = i_d
+        n = n + 1
+    return n
+
+
+@qd.func
 def _sort_relevant_dofs_descending(
     constraint_state: array_class.ConstraintState,
     i_con: qd.int32,
@@ -302,29 +332,14 @@ class ConstraintSolver:
         )
 
     def noslip(self):
-        if self._solver._para_level >= gs.PARA_LEVEL.PARTIAL:
-            # GPU (any n_envs): one kernel decomposed into per-phase offloaded tasks, so that each phase keeps its
-            # own parallel launch shape.
-            constraint_noslip.kernel_noslip_decomposed(
-                self._collider._collider_state,
-                self._solver.dofs_state,
-                self._solver.entities_info,
-                self._solver._rigid_global_info,
-                self.constraint_state,
-                self._solver._static_rigid_sim_config,
-            )
-        else:
-            # Serialized (CPU): single fused kernel processing each env end-to-end, so that the per-env AR scratch stays
-            # cache-hot between the AR build and the force-update sweep (func_noslip_batch).
-            constraint_noslip.kernel_noslip_fused(
-                self._collider._collider_state,
-                self._solver.dofs_state,
-                self._solver.entities_info,
-                self._solver._rigid_global_info,
-                self.constraint_state,
-                self.island_state,
-                self._solver._static_rigid_sim_config,
-            )
+        constraint_noslip.kernel_noslip(
+            self._collider._collider_state,
+            self._solver.dofs_state,
+            self._solver._rigid_global_info,
+            self.constraint_state,
+            self.island_state,
+            self._solver._static_rigid_sim_config,
+        )
 
     def get_equality_constraints(self, as_tensor: bool = True, to_torch: bool = True):
         # Early return if already pre-computed
@@ -670,6 +685,7 @@ def _add_friction_constraint(
         for i_d in range(n_dofs):
             constraint_state.jac[n_con, i_d, i_b] = gs.qd_float(0.0)
 
+    same_root = link_b > -1 and links_info.root_idx[link_a_maybe_batch] == links_info.root_idx[link_b_maybe_batch]
     con_n_dofs = 0
     jac_qvel = gs.qd_float(0.0)
     for i_ab in range(2):
@@ -698,8 +714,9 @@ def _add_friction_constraint(
                 jac_qvel = jac_qvel + jac * dofs_state.vel[i_d, i_b]
                 constraint_state.jac[n_con, i_d, i_b] = constraint_state.jac[n_con, i_d, i_b] + jac
 
-                constraint_state.jac_dofs_idx[n_con, con_n_dofs, i_b] = i_d
-                con_n_dofs = con_n_dofs + 1
+                con_n_dofs = _append_relevant_dof(
+                    constraint_state, n_con, i_d, con_n_dofs, i_b, i_ab == 1 and same_root
+                )
 
             link = links_info.parent_idx[link_maybe_batch]
 
@@ -848,6 +865,9 @@ def _add_collision_constraints_per_contact(
                     for i_d in range(n_dofs):
                         constraint_state.jac[n_con, i_d, i_b] = gs.qd_float(0.0)
 
+                same_root = (
+                    link_b > -1 and links_info.root_idx[link_a_maybe_batch] == links_info.root_idx[link_b_maybe_batch]
+                )
                 con_n_dofs = 0
                 jac_qvel = gs.qd_float(0.0)
                 for i_ab in range(2):
@@ -876,8 +896,9 @@ def _add_collision_constraints_per_contact(
                             jac_qvel = jac_qvel + jac * dofs_state.vel[i_d, i_b]
                             constraint_state.jac[n_con, i_d, i_b] = constraint_state.jac[n_con, i_d, i_b] + jac
 
-                            constraint_state.jac_dofs_idx[n_con, con_n_dofs, i_b] = i_d
-                            con_n_dofs = con_n_dofs + 1
+                            con_n_dofs = _append_relevant_dof(
+                                constraint_state, n_con, i_d, con_n_dofs, i_b, i_ab == 1 and same_root
+                            )
 
                         link = links_info.parent_idx[link_maybe_batch]
 
@@ -997,6 +1018,9 @@ def func_equality_connect(
             for i_d in range(n_dofs):
                 constraint_state.jac[n_con, i_d, i_b] = gs.qd_float(0.0)
 
+        same_root = (
+            link2_idx > -1 and links_info.root_idx[link_a_maybe_batch] == links_info.root_idx[link_b_maybe_batch]
+        )
         jac_qvel = gs.qd_float(0.0)
         for i_ab in range(2):
             sign = gs.qd_float(1.0)
@@ -1025,8 +1049,9 @@ def func_equality_connect(
                     jac_qvel = jac_qvel + jac * dofs_state.vel[i_d, i_b]
                     constraint_state.jac[n_con, i_d, i_b] = constraint_state.jac[n_con, i_d, i_b] + jac
 
-                    constraint_state.jac_dofs_idx[n_con, con_n_dofs, i_b] = i_d
-                    con_n_dofs = con_n_dofs + 1
+                    con_n_dofs = _append_relevant_dof(
+                        constraint_state, n_con, i_d, con_n_dofs, i_b, i_ab == 1 and same_root
+                    )
 
                 link = links_info.parent_idx[link_maybe_batch]
 
@@ -1474,6 +1499,7 @@ def func_equality_weld(
     invweight = links_info.invweight[link_a_maybe_batch] + links_info.invweight[link_b_maybe_batch]
 
     # --- Position part (first 3 constraints) ---
+    same_root = link2_idx > -1 and links_info.root_idx[link_a_maybe_batch] == links_info.root_idx[link_b_maybe_batch]
     for i in range(3):
         n_con = qd.atomic_add(constraint_state.n_constraints[i_b], 1)
         qd.atomic_add(constraint_state.n_constraints_equality[i_b], 1)
@@ -1511,8 +1537,9 @@ def func_equality_weld(
                     jac_qvel = jac_qvel + jac * dofs_state.vel[i_d, i_b]
                     constraint_state.jac[n_con, i_d, i_b] = constraint_state.jac[n_con, i_d, i_b] + jac
 
-                    constraint_state.jac_dofs_idx[n_con, con_n_dofs, i_b] = i_d
-                    con_n_dofs = con_n_dofs + 1
+                    con_n_dofs = _append_relevant_dof(
+                        constraint_state, n_con, i_d, con_n_dofs, i_b, i_ab == 1 and same_root
+                    )
                 link = links_info.parent_idx[link_maybe_batch]
 
         constraint_state.jac_n_dofs[n_con, i_b] = con_n_dofs
@@ -1550,9 +1577,12 @@ def func_equality_weld(
 
                 # The 3 orientation constraints share the same support (the DOFs along both kinematic chains); record
                 # it so sparse assembly does not drop them. (The position part above does the same per constraint.)
+                n_dofs_new = con_n_dofs
                 for i_con in range(n_con, n_con + 3):
-                    constraint_state.jac_dofs_idx[i_con, con_n_dofs, i_b] = i_d
-                con_n_dofs = con_n_dofs + 1
+                    n_dofs_new = _append_relevant_dof(
+                        constraint_state, i_con, i_d, con_n_dofs, i_b, i_ab == 1 and same_root
+                    )
+                con_n_dofs = n_dofs_new
             link = links_info.parent_idx[link_maybe_batch]
 
     jac_qvel = qd.Vector([0.0, 0.0, 0.0])
@@ -4799,10 +4829,11 @@ def func_update_gradient(
     if qd.static(
         not (static_rigid_sim_config.enable_tiled_cholesky_hessian and static_rigid_sim_config.hessian_fits_shared)
         or static_rigid_sim_config.backend == gs.cpu
-        or static_rigid_sim_config.use_contact_island
+        or static_rigid_sim_config.enable_per_island_solve
     ):
-        # CPU, or islands: the tiled factor/solve operates on the whole-env dense Hessian, but with islands nt_H
-        # holds the per-island block-diagonal factor, so the gradient solve must go per-island (func_cholesky_solve_batch).
+        # CPU, or per-island decomposition: the tiled solve operates on the whole-env dense Hessian, but a per-island
+        # factor leaves nt_H block-diagonal by island, so the gradient solve must go per-island via
+        # func_cholesky_solve_batch. A single whole-env island keeps the tiled solve, like islands off.
         qd.loop_config(
             name="update_gradient", serialize=static_rigid_sim_config.para_level < gs.PARA_LEVEL.ALL, block_dim=32
         )
@@ -5192,7 +5223,7 @@ def func_solve_init(
             and (
                 is_decomposed
                 or not (
-                    static_rigid_sim_config.use_contact_island
+                    static_rigid_sim_config.enable_per_island_solve
                     and static_rigid_sim_config.backend != gs.cpu
                     and not static_rigid_sim_config.enable_cooperative_constraint_kernels
                 )
@@ -5202,10 +5233,11 @@ def func_solve_init(
             # its first linesearch consumes the search direction computed here (this kernel is its "iteration 0"; the
             # graph then computes each subsequent direction at the end of an iteration). So it ALWAYS needs this seed,
             # islands on or off. The monolith seeds it here except in the one case where its body self-inits the factor
-            # per-env: the GPU island arm with the cooperative kernels disabled (the only case keyed below). With the
-            # cooperative kernels enabled the body does NOT self-init, so the seed must run here even for GPU islands -
-            # otherwise a shared-fitting Hessian at an env count that oversaturates the GPU (where neither the fused nor
-            # the per-island seed branch above fires) would leave Mgrad stale.
+            # per-env: the GPU per-island-decomposition arm (enable_per_island_solve) with the cooperative kernels
+            # disabled (the only case keyed below). With the cooperative kernels enabled the body does NOT self-init, so
+            # the seed must run here even for per-island decomposition - otherwise a shared-fitting Hessian at an env
+            # count that oversaturates the GPU (where neither the fused nor the per-island seed branch above fires)
+            # would leave Mgrad stale.
             # compute_envelope=True computes each island's structural skyline envelope once, reused per iteration.
             func_hessian_and_cholesky_factor_direct(
                 island_state=island_state,
@@ -5220,15 +5252,16 @@ def func_solve_init(
             not (
                 static_rigid_sim_config.solver_type == gs.constraint_solver.Newton
                 and not is_decomposed
-                and static_rigid_sim_config.use_contact_island
+                and static_rigid_sim_config.enable_per_island_solve
                 and static_rigid_sim_config.backend != gs.cpu
                 and not static_rigid_sim_config.enable_cooperative_constraint_kernels
             )
         ):
             # Initial gradient (Mgrad = H^-1 grad for Newton, grad for CG). Seeds the decomposed arm's first search
-            # direction, so it runs for the decomposed arm in all cases. Skipped only for the GPU island monolith with
-            # the cooperative kernels disabled, which self-inits the gradient per-env in its own body; with them enabled
-            # the body does not self-init, so the seed must run here.
+            # direction, so it runs for the decomposed arm in all cases. Skipped only for the GPU per-island-
+            # decomposition monolith (enable_per_island_solve) with the cooperative kernels disabled, which self-inits
+            # the gradient per-env in its own body; with them enabled the body does not self-init, so the seed must run
+            # here.
             func_update_gradient(
                 dofs_state=dofs_state,
                 entities_info=entities_info,
@@ -5435,15 +5468,15 @@ def _kernel_solve_monolith(
             has_awake_work = has_awake_work and rigid_global_info.n_awake_dofs[i_b] > 0
         if has_awake_work:
             if qd.static(
-                static_rigid_sim_config.use_contact_island
+                static_rigid_sim_config.enable_per_island_solve
                 and static_rigid_sim_config.backend != gs.cpu
                 and static_rigid_sim_config.solver_type == gs.constraint_solver.Newton
                 and not static_rigid_sim_config.enable_cooperative_constraint_kernels
             ):
-                # Without the cooperative kernels, func_solve_init skips the GPU-island tiled seed, so the monolith
-                # seeds this env's initial scalar per-island factor + gradient + search here. Gives the first
-                # linesearch a valid Newton direction; once per step, then iterate. With cooperative kernels enabled,
-                # func_solve_init already seeded the factor (L persisted to nt_H) and the search direction.
+                # Per-island decomposition with the cooperative kernels off: func_solve_init skips its seed, so the
+                # monolith self-seeds each island's scalar factor + gradient + search here (once per step). Gated on
+                # enable_per_island_solve, so a single whole-env island takes func_solve_init's fast seed instead, like
+                # islands off. With the cooperative kernels on, func_solve_init already seeded the factor (L in nt_H).
                 func_hessian_and_cholesky_factor_direct_batch(
                     i_b,
                     island_state=island_state,
